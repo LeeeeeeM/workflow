@@ -39,7 +39,6 @@ cc_library(
 cc_library(
 	name = 'common',
 	srcs = [
-		'src/algorithm/DnsRoutine.cc',
 		'src/client/WFDnsClient.cc',
 		'src/factory/DnsTaskImpl.cc',
 		'src/factory/FileTaskImpl.cc',
@@ -53,6 +52,7 @@ cc_library(
 		'src/manager/WFGlobal.cc',
 		'src/nameservice/WFDnsResolver.cc',
 		'src/nameservice/WFNameService.cc',
+		'src/protocol/TLVMessage.cc',
 		'src/protocol/DnsMessage.cc',
 		'src/protocol/DnsUtil.cc',
 		'src/protocol/SSLWrapper.cc',
@@ -113,9 +113,11 @@ cc_library(
 cc_library(
 	name = 'redis',
 	hdrs = [
+		'src/factory/RedisTaskImpl.inl',
 		'src/protocol/RedisMessage.h',
 		'src/protocol/redis_parser.h',
 		'src/server/WFRedisServer.h',
+		'src/client/WFRedisSubscriber.h',
 	],
 	includes = [
 		'src/protocol',
@@ -125,6 +127,7 @@ cc_library(
 		'src/factory/RedisTaskImpl.cc',
 		'src/protocol/RedisMessage.cc',
 		'src/protocol/redis_parser.c',
+		'src/client/WFRedisSubscriber.cc',
 	],
 	deps = [
 		':common',
@@ -134,7 +137,6 @@ cc_library(
 cc_library(
 	name = 'mysql',
 	hdrs = [
-		'src/client/WFMySQLConnection.h',
 		'src/protocol/MySQLMessage.h',
 		'src/protocol/MySQLMessage.inl',
 		'src/protocol/MySQLResult.h',
@@ -145,6 +147,7 @@ cc_library(
 		'src/protocol/mysql_stream.h',
 		'src/protocol/mysql_types.h',
 		'src/server/WFMySQLServer.h',
+		'src/client/WFMySQLConnection.h',
 	],
 	includes = [
 		'src/protocol',
@@ -152,7 +155,6 @@ cc_library(
 		'src/server',
 	],
 	srcs = [
-		'src/client/WFMySQLConnection.cc',
 		'src/factory/MySQLTaskImpl.cc',
 		'src/protocol/MySQLMessage.cc',
 		'src/protocol/MySQLResult.cc',
@@ -160,6 +162,7 @@ cc_library(
 		'src/protocol/mysql_byteorder.c',
 		'src/protocol/mysql_parser.c',
 		'src/protocol/mysql_stream.c',
+		'src/client/WFMySQLConnection.cc',
 	],
 	deps = [
 		':common',
@@ -263,6 +266,7 @@ cc_library(
 	],
 	deps = [
 		':common',
+		':http',
 	],
 	visibility = ["//visibility:public"],
 )
@@ -371,4 +375,10 @@ cc_binary(
 	 name = 'consul_cli',
 	 srcs = ['tutorial/tutorial-14-consul_cli.cc'],
 	 deps = [':consul'],
+)
+
+cc_binary(
+	 name = 'redis_subscriber',
+	 srcs = ['tutorial/tutorial-18-redis_subscriber.cc'],
+	 deps = [':redis'],
 )

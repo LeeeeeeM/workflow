@@ -29,6 +29,9 @@ if (WIN32)
 else ()
 		set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -Wall -fPIC -pipe -std=gnu90")
 		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -fPIC -pipe -std=c++11 -fno-exceptions")
+		if (APPLE)
+			set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
+		endif()
 endif ()
 
 set(TUTORIAL_LIST
@@ -43,7 +46,6 @@ set(TUTORIAL_LIST
 	tutorial-11-graph_task
 	tutorial-15-name_service
 	tutorial-17-dns_cli
-	tutorial-20-reducer
 )
 
 if (APPLE)
@@ -65,6 +67,7 @@ if (NOT REDIS STREQUAL "n")
 set(TUTORIAL_LIST
 	tutorial-02-redis_cli
 	tutorial-03-wget_to_redis
+	tutorial-18-redis_subscriber
 )
 foreach(src ${TUTORIAL_LIST})
 	string(REPLACE "-" ";" arr ${src})

@@ -17,6 +17,7 @@
            Wang Zhulei (wangzhulei@sogou-inc.com)
 */
 
+#include <stdlib.h>
 #include <pthread.h>
 #include <algorithm>
 #include <random>
@@ -29,7 +30,7 @@ class EndpointGroup
 public:
 	EndpointGroup(int group_id, UPSGroupPolicy *policy) :
 			mutex(PTHREAD_MUTEX_INITIALIZER),
-			gen(rd())
+			gen(rand())
 	{
 		this->id = group_id;
 		this->policy = policy;
@@ -45,7 +46,6 @@ public:
 	UPSGroupPolicy *policy;
 	struct rb_node rb;
 	pthread_mutex_t mutex;
-	std::random_device rd;
 	std::mt19937 gen;
 	std::vector<EndpointAddress *> mains;
 	std::vector<EndpointAddress *> backups;
@@ -360,7 +360,6 @@ int UPSGroupPolicy::remove_server_locked(const std::string& address)
 			else
 				vec = &group->backups;
 
-			//std::lock_guard<std::mutex> lock(group->mutex);
 			pthread_mutex_lock(&group->mutex);
 			if (params->server_type == 0)
 				group->weight -= params->weight;
@@ -411,6 +410,8 @@ EndpointAddress *UPSGroupPolicy::consistent_hash_with_group(unsigned int hash,
 
 	return this->check_and_get(it->second, false, tracing);
 }
+
+#define VIRTUAL_GROUP_SIZE	16
 
 void UPSGroupPolicy::hash_map_add_addr(EndpointAddress *addr)
 {
@@ -572,6 +573,9 @@ EndpointAddress *UPSWeightedRandomPolicy::another_strategy(const ParsedURI& uri,
 				break;
 		}
 	}
+
+	if (!addr)
+		return NULL;
 
 	return this->check_and_get(addr, false, tracing);
 }

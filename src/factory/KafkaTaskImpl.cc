@@ -14,10 +14,12 @@
   limitations under the License.
 
   Authors: Wang Zhulei (wangzhulei@sogou-inc.com)
+           Xie Han (xiehan@sogou-inc.com)
 */
 
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 #include <string>
 #include <set>
 #include <openssl/sha.h>
@@ -30,10 +32,22 @@ using namespace protocol;
 #define KAFKA_KEEPALIVE_DEFAULT	(60 * 1000)
 #define KAFKA_ROUNDTRIP_TIMEOUT (5 * 1000)
 
+static KafkaCgroup __create_cgroup(const KafkaCgroup *c)
+{
+	KafkaCgroup g;
+	const char *member_id = c->get_member_id();
+
+	if (member_id)
+		g.set_member_id(member_id);
+
+	g.set_group(c->get_group());
+
+	return g;
+}
+
 /**********Client**********/
 
-class __ComplexKafkaTask : public WFComplexClientTask<KafkaRequest, KafkaResponse,
-													  struct __ComplexKafkaTaskCtx>
+class __ComplexKafkaTask : public WFComplexClientTask<KafkaRequest, KafkaResponse, int>
 {
 public:
 	__ComplexKafkaTask(int retry_max, __kafka_callback_t&& callback) :
@@ -41,7 +55,7 @@ public:
 	{
 		is_user_request_ = true;
 		is_redirect_ = false;
-		ctx_.kafka_error = 0;
+		ctx_ = 0;
 	}
 
 protected:
@@ -104,7 +118,6 @@ private:
 	virtual int keep_alive_timeout();
 	virtual int first_timeout();
 	bool has_next();
-	bool check_redirect();
 	bool process_produce();
 	bool process_fetch();
 	bool process_metadata();
@@ -194,62 +207,53 @@ CommMessageOut *__ComplexKafkaTask::message_out()
 
 	KafkaConnectionInfo *conn_info =
 		(KafkaConnectionInfo *)this->get_connection()->get_context();
-	this->get_req()->set_api(&conn_info->api);
+	KafkaRequest *req = this->get_req();
+	req->set_api(&conn_info->api);
 
-	if (this->get_req()->get_api_type() == Kafka_Fetch ||
-		this->get_req()->get_api_type() == Kafka_ListOffsets)
+	if (req->get_api_type() == Kafka_Fetch ||
+		req->get_api_type() == Kafka_ListOffsets)
 	{
-		KafkaRequest *req = this->get_req();
-		req->get_toppar_list()->rewind();
+		KafkaTopparList *req_toppar_lst = req->get_toppar_list();
 		KafkaToppar *toppar;
 		KafkaTopparList toppar_list;
 		bool flag = false;
+		long long cfg_ts = req->get_config()->get_offset_timestamp();
+		long long tp_ts;
 
-		while ((toppar = req->get_toppar_list()->get_next()) != NULL)
+		req_toppar_lst->rewind();
+		while ((toppar = req_toppar_lst->get_next()) != NULL)
 		{
-			if (toppar->get_low_watermark() < 0)
-				toppar->set_offset_timestamp(KAFKA_TIMESTAMP_EARLIEST);
-			else if (toppar->get_high_watermark() < 0)
-				toppar->set_offset_timestamp(KAFKA_TIMESTAMP_LATEST);
-			else if (toppar->get_offset() == KAFKA_OFFSET_UNINIT)
+			tp_ts = toppar->get_offset_timestamp();
+			if (tp_ts == KAFKA_TIMESTAMP_UNINIT)
+				tp_ts = cfg_ts;
+
+			if (toppar->get_offset() == KAFKA_OFFSET_UNINIT)
 			{
-				long long conf_ts =
-					this->get_req()->get_config()->get_offset_timestamp();
-				if (conf_ts == KAFKA_TIMESTAMP_EARLIEST)
-				{
+				if (tp_ts == KAFKA_TIMESTAMP_EARLIEST)
 					toppar->set_offset(toppar->get_low_watermark());
-					continue;
-				}
-				else if (conf_ts == KAFKA_TIMESTAMP_LATEST)
+				else if (tp_ts < 0)
 				{
 					toppar->set_offset(toppar->get_high_watermark());
-					continue;
-				}
-				else
-				{
-					toppar->set_offset_timestamp(conf_ts);
+					tp_ts = KAFKA_TIMESTAMP_LATEST;
 				}
 			}
 			else if (toppar->get_offset() == KAFKA_OFFSET_OVERFLOW)
 			{
-				if (this->get_req()->get_config()->get_offset_timestamp() ==
-					KAFKA_TIMESTAMP_EARLIEST)
-				{
+				if (tp_ts == KAFKA_TIMESTAMP_EARLIEST)
 					toppar->set_offset(toppar->get_low_watermark());
-				}
 				else
 				{
 					toppar->set_offset(toppar->get_high_watermark());
+					tp_ts = KAFKA_TIMESTAMP_LATEST;
 				}
-				continue;
-			}
-			else
-			{
-				continue;
 			}
 
-			toppar_list.add_item(*toppar);
-			flag = true;
+			if (toppar->get_offset() < 0)
+			{
+				toppar->set_offset_timestamp(tp_ts);
+				toppar_list.add_item(*toppar);
+				flag = true;
+			}
 		}
 
 		if (flag)
@@ -274,29 +278,40 @@ CommMessageIn *__ComplexKafkaTask::message_in()
 {
 	KafkaRequest *req = static_cast<KafkaRequest *>(this->get_message_out());
 	KafkaResponse *resp = this->get_resp();
+	KafkaCgroup *cgroup;
 
 	resp->set_api_type(req->get_api_type());
 	resp->set_api_version(req->get_api_version());
 	resp->duplicate(*req);
+
+	switch (req->get_api_type())
+	{
+	case Kafka_FindCoordinator:
+	case Kafka_Heartbeat:
+		cgroup = req->get_cgroup();
+		if (cgroup->get_group())
+			resp->set_cgroup(__create_cgroup(cgroup));
+		break;
+	default:
+		break;
+	}
 
 	return this->WFComplexClientTask::message_in();
 }
 
 bool __ComplexKafkaTask::init_success()
 {
-	TransportType type = TT_TCP;
-	if (uri_.scheme)
+	enum TransportType type;
+
+	if (uri_.scheme && strcasecmp(uri_.scheme, "kafka") == 0)
+		type = TT_TCP;
+	else if (uri_.scheme && strcasecmp(uri_.scheme, "kafkas") == 0)
+		type = TT_TCP_SSL;
+	else
 	{
-		if (strcasecmp(uri_.scheme, "kafka") == 0)
-			type = TT_TCP;
-		//else if (uri_.scheme && strcasecmp(uri_.scheme, "kafkas") == 0)
-		//	type = TT_TCP_SSL;
-		else
-		{
-			this->state = WFT_STATE_TASK_ERROR;
-			this->error = WFT_ERR_URI_SCHEME_INVALID;
-			return false;
-		}
+		this->state = WFT_STATE_TASK_ERROR;
+		this->error = WFT_ERR_URI_SCHEME_INVALID;
+		return false;
 	}
 
 	std::string username, password, sasl, client;
@@ -341,7 +356,6 @@ bool __ComplexKafkaTask::init_success()
 	}
 
 	this->WFComplexClientTask::set_transport_type(type);
-
 	return true;
 }
 
@@ -383,51 +397,11 @@ int __ComplexKafkaTask::first_timeout()
 	return ret + KAFKA_ROUNDTRIP_TIMEOUT;
 }
 
-bool __ComplexKafkaTask::check_redirect()
-{
-	struct sockaddr_storage addr;
-	socklen_t addrlen = sizeof addr;
-	const struct sockaddr *paddr = (const struct sockaddr *)&addr;
-	KafkaBroker *coordinator = this->get_req()->get_cgroup()->get_coordinator();
-
-	//always success
-	this->get_peer_addr((struct sockaddr *)&addr, &addrlen);
-	if (!coordinator->is_equal(paddr, addrlen))
-	{
-		if (coordinator->is_to_addr())
-		{
-			const struct sockaddr *addr_coord;
-			socklen_t addrlen_coord;
-
-			coordinator->get_broker_addr(&addr_coord, &addrlen_coord);
-			set_redirect(TT_TCP, addr_coord, addrlen_coord,
-						 this->WFComplexClientTask::info_);
-		}
-		else
-		{
-			std::string url = "kafka://";
-			url += user_info_ + "@";
-			url += coordinator->get_host();
-			url += ":" + std::to_string(coordinator->get_port());
-
-			ParsedURI uri;
-			URIParser::parse(url, uri);
-			set_redirect(std::move(uri));
-		}
-
-		return true;
-	}
-	else
-	{
-		this->init(TT_TCP, paddr, addrlen, this->WFComplexClientTask::info_);
-		return false;
-	}
-}
-
 bool __ComplexKafkaTask::process_find_coordinator()
 {
-	ctx_.kafka_error = this->get_resp()->get_cgroup()->get_error();
-	if (ctx_.kafka_error)
+	KafkaCgroup *cgroup = this->get_resp()->get_cgroup();
+	ctx_ = cgroup->get_error();
+	if (ctx_)
 	{
 		this->error = WFT_ERR_KAFKA_CGROUP_FAILED;
 		this->state = WFT_STATE_TASK_ERROR;
@@ -435,8 +409,19 @@ bool __ComplexKafkaTask::process_find_coordinator()
 	}
 	else
 	{
-		is_redirect_ = check_redirect();
+		this->get_req()->set_cgroup(*cgroup);
+		KafkaBroker *coordinator = cgroup->get_coordinator();
+		std::string url(uri_.scheme);
+		url += "://";
+		url += user_info_ + "@";
+		url += coordinator->get_host();
+		url += ":" + std::to_string(coordinator->get_port());
+
+		ParsedURI uri;
+		URIParser::parse(url, uri);
+		set_redirect(std::move(uri));
 		this->get_req()->set_api_type(Kafka_JoinGroup);
+		is_redirect_ = true;
 		return true;
 	}
 }
@@ -444,16 +429,6 @@ bool __ComplexKafkaTask::process_find_coordinator()
 bool __ComplexKafkaTask::process_join_group()
 {
 	KafkaResponse *msg = this->get_resp();
-	if (!msg->get_cgroup()->get_coordinator()->is_to_addr())
-	{
-		struct sockaddr_storage addr;
-		socklen_t addrlen = sizeof addr;
-		const struct sockaddr *paddr = (const struct sockaddr *)&addr;
-		this->get_peer_addr((struct sockaddr *)&addr, &addrlen);
-		msg->get_cgroup()->get_coordinator()->set_broker_addr(paddr, addrlen);
-		msg->get_cgroup()->get_coordinator()->set_to_addr(1);
-	}
-
 	switch(msg->get_cgroup()->get_error())
 	{
 	case KAFKA_MEMBER_ID_REQUIRED:
@@ -470,7 +445,7 @@ bool __ComplexKafkaTask::process_join_group()
 		break;
 
 	default:
-		ctx_.kafka_error = msg->get_cgroup()->get_error();
+		ctx_ = msg->get_cgroup()->get_error();
 		this->error = WFT_ERR_KAFKA_CGROUP_FAILED;
 		this->state = WFT_STATE_TASK_ERROR;
 		return false;
@@ -481,8 +456,8 @@ bool __ComplexKafkaTask::process_join_group()
 
 bool __ComplexKafkaTask::process_sync_group()
 {
-	ctx_.kafka_error = this->get_resp()->get_cgroup()->get_error();
-	if (ctx_.kafka_error)
+	ctx_ = this->get_resp()->get_cgroup()->get_error();
+	if (ctx_)
 	{
 		this->error = WFT_ERR_KAFKA_CGROUP_FAILED;
 		this->state = WFT_STATE_TASK_ERROR;
@@ -510,13 +485,14 @@ bool __ComplexKafkaTask::process_metadata()
 		case 0:
 			break;
 		default:
-			ctx_.kafka_error = meta->get_error();
+			ctx_ = meta->get_error();
 			this->error = WFT_ERR_KAFKA_META_FAILED;
 			this->state = WFT_STATE_TASK_ERROR;
 			return false;
 		}
 	}
 
+	this->get_req()->set_meta_list(*msg->get_meta_list());
 	if (msg->get_cgroup()->get_group())
 	{
 		if (msg->get_cgroup()->is_leader())
@@ -545,31 +521,18 @@ bool __ComplexKafkaTask::process_fetch()
 	this->get_resp()->get_toppar_list()->rewind();
 	while ((toppar = this->get_resp()->get_toppar_list()->get_next()) != NULL)
 	{
-		if (toppar->get_error() == KAFKA_OFFSET_OUT_OF_RANGE &&
-			toppar->get_high_watermark() - toppar->get_low_watermark() > 0)
+		int toppar_error = toppar->get_error();
+
+		if (toppar_error == KAFKA_OFFSET_OUT_OF_RANGE)
 		{
 			toppar->set_offset(KAFKA_OFFSET_OVERFLOW);
 			toppar->set_low_watermark(KAFKA_OFFSET_UNINIT);
 			toppar->set_high_watermark(KAFKA_OFFSET_UNINIT);
 			ret = true;
 		}
-
-		switch (toppar->get_error())
+		else if (toppar_error)
 		{
-		case KAFKA_UNKNOWN_TOPIC_OR_PARTITION:
-		case KAFKA_LEADER_NOT_AVAILABLE:
-		case KAFKA_NOT_LEADER_FOR_PARTITION:
-		case KAFKA_BROKER_NOT_AVAILABLE:
-		case KAFKA_REPLICA_NOT_AVAILABLE:
-		case KAFKA_KAFKA_STORAGE_ERROR:
-		case KAFKA_FENCED_LEADER_EPOCH:
-			this->get_req()->set_api_type(Kafka_Metadata);
-			return true;
-		case 0:
-		case KAFKA_OFFSET_OUT_OF_RANGE:
-			break;
-		default:
-			ctx_.kafka_error = toppar->get_error();
+			ctx_ = toppar_error;
 			this->error = WFT_ERR_KAFKA_FETCH_FAILED;
 			this->state = WFT_STATE_TASK_ERROR;
 			return false;
@@ -605,21 +568,10 @@ bool __ComplexKafkaTask::process_produce()
 			return true;
 		}
 
-		switch (toppar->get_error())
+		if (toppar->get_error())
 		{
-		case KAFKA_UNKNOWN_TOPIC_OR_PARTITION:
-		case KAFKA_LEADER_NOT_AVAILABLE:
-		case KAFKA_NOT_LEADER_FOR_PARTITION:
-		case KAFKA_BROKER_NOT_AVAILABLE:
-		case KAFKA_REPLICA_NOT_AVAILABLE:
-		case KAFKA_KAFKA_STORAGE_ERROR:
-		case KAFKA_FENCED_LEADER_EPOCH:
-			this->get_req()->set_api_type(Kafka_Metadata);
-			return true;
-		case 0:
-			break;
-		default:
-			this->error = toppar->get_error();
+			ctx_ = toppar->get_error();
+			this->error = WFT_ERR_KAFKA_PRODUCE_FAILED;
 			this->state = WFT_STATE_TASK_ERROR;
 			return false;
 		}
@@ -629,8 +581,8 @@ bool __ComplexKafkaTask::process_produce()
 
 bool __ComplexKafkaTask::process_sasl_handshake()
 {
-	ctx_.kafka_error = this->get_resp()->get_broker()->get_error();
-	if (ctx_.kafka_error)
+	ctx_ = this->get_resp()->get_broker()->get_error();
+	if (ctx_)
 	{
 		this->error = WFT_ERR_KAFKA_SASL_DISALLOWED;
 		this->state = WFT_STATE_TASK_ERROR;
@@ -641,8 +593,8 @@ bool __ComplexKafkaTask::process_sasl_handshake()
 
 bool __ComplexKafkaTask::process_sasl_authenticate()
 {
-	ctx_.kafka_error = this->get_resp()->get_broker()->get_error();
-	if (ctx_.kafka_error)
+	ctx_ = this->get_resp()->get_broker()->get_error();
+	if (ctx_)
 	{
 		this->error = WFT_ERR_KAFKA_SASL_DISALLOWED;
 		this->state = WFT_STATE_TASK_ERROR;
@@ -652,18 +604,6 @@ bool __ComplexKafkaTask::process_sasl_authenticate()
 
 bool __ComplexKafkaTask::has_next()
 {
-	struct sockaddr_storage addr;
-	socklen_t addrlen = sizeof addr;
-	//always success
-	this->get_peer_addr((struct sockaddr *)&addr, &addrlen);
-
-	const struct sockaddr *paddr = (const struct sockaddr *)&addr;
-	if (!this->get_resp()->get_broker()->is_to_addr())
-	{
-		this->get_resp()->get_broker()->set_broker_addr(paddr, addrlen);
-		this->get_resp()->get_broker()->set_to_addr(1);
-	}
-
 	switch (this->get_resp()->get_api_type())
 	{
 	case Kafka_Produce:
@@ -689,8 +629,8 @@ bool __ComplexKafkaTask::has_next()
 	case Kafka_LeaveGroup:
 	case Kafka_DescribeGroups:
 	case Kafka_Heartbeat:
-		ctx_.kafka_error = this->get_resp()->get_cgroup()->get_error();
-		if (ctx_.kafka_error)
+		ctx_ = this->get_resp()->get_cgroup()->get_error();
+		if (ctx_)
 		{
 			this->error = WFT_ERR_KAFKA_CGROUP_FAILED;
 			this->state = WFT_STATE_TASK_ERROR;
@@ -723,10 +663,8 @@ bool __ComplexKafkaTask::finish_once()
 	{
 		this->get_req()->clear_buf();
 		is_redirect_ = false;
-		return true;
 	}
-
-	if (this->state == WFT_STATE_SUCCESS)
+	else if (this->state == WFT_STATE_SUCCESS)
 	{
 		if (!is_user_request_)
 		{
@@ -743,27 +681,25 @@ bool __ComplexKafkaTask::finish_once()
 	}
 	else
 	{
-		this->disable_retry();
 		this->get_resp()->set_api_type(this->get_req()->get_api_type());
 		this->get_resp()->set_api_version(this->get_req()->get_api_version());
-		this->get_resp()->duplicate(*this->get_req());
 	}
 
-	if (ctx_.cb)
-		ctx_.cb(this);
-
+	is_user_request_ = true;
 	return true;
 }
 
 /**********Factory**********/
 // kafka://user:password:sasl@host:port/api=type&topic=name
 __WFKafkaTask *__WFKafkaTaskFactory::create_kafka_task(const std::string& url,
+													   SSL_CTX *ssl_ctx,
 													   int retry_max,
 													   __kafka_callback_t callback)
 {
 	auto *task = new __ComplexKafkaTask(retry_max, std::move(callback));
-	ParsedURI uri;
+	task->set_ssl_ctx(ssl_ctx);
 
+	ParsedURI uri;
 	URIParser::parse(url, uri);
 	task->init(std::move(uri));
 	task->set_keep_alive(KAFKA_KEEPALIVE_DEFAULT);
@@ -771,47 +707,53 @@ __WFKafkaTask *__WFKafkaTaskFactory::create_kafka_task(const std::string& url,
 }
 
 __WFKafkaTask *__WFKafkaTaskFactory::create_kafka_task(const ParsedURI& uri,
+													   SSL_CTX *ssl_ctx,
 													   int retry_max,
 													   __kafka_callback_t callback)
 {
 	auto *task = new __ComplexKafkaTask(retry_max, std::move(callback));
+	task->set_ssl_ctx(ssl_ctx);
 
 	task->init(uri);
 	task->set_keep_alive(KAFKA_KEEPALIVE_DEFAULT);
 	return task;
 }
 
-__WFKafkaTask *__WFKafkaTaskFactory::create_kafka_task(const struct sockaddr *addr,
-													   socklen_t addrlen,
-													   const std::string& info,
-													   int retry_max,
-													   __kafka_callback_t callback)
-{
-	auto *task = new __ComplexKafkaTask(retry_max, std::move(callback));
-
-	task->init(TT_TCP, addr, addrlen, info);
-	task->set_keep_alive(KAFKA_KEEPALIVE_DEFAULT);
-	return task;
-}
-
-__WFKafkaTask *__WFKafkaTaskFactory::create_kafka_task(const char *host,
+__WFKafkaTask *__WFKafkaTaskFactory::create_kafka_task(enum TransportType type,
+													   const char *host,
 													   unsigned short port,
+													   SSL_CTX *ssl_ctx,
 													   const std::string& info,
 													   int retry_max,
 													   __kafka_callback_t callback)
 {
 	auto *task = new __ComplexKafkaTask(retry_max, std::move(callback));
-
-	std::string url = "kafka://";
-
-	if (!info.empty())
-		url += info;
-
-	url += host;
-	url += ":" + std::to_string(port);
+	task->set_ssl_ctx(ssl_ctx);
 
 	ParsedURI uri;
-	URIParser::parse(url, uri);
+	char buf[32];
+
+	if (type == TT_TCP_SSL)
+		uri.scheme = strdup("kafkas");
+	else
+		uri.scheme = strdup("kafka");
+
+	if (!info.empty())
+		uri.userinfo = strdup(info.c_str());
+
+	uri.host = strdup(host);
+	sprintf(buf, "%u", port);
+	uri.port = strdup(buf);
+
+	if (!uri.scheme || !uri.host || !uri.port ||
+		(!info.empty() && !uri.userinfo))
+	{
+		uri.state = URI_STATE_ERROR;
+		uri.error = errno;
+	}
+	else
+		uri.state = URI_STATE_SUCCESS;
+
 	task->init(std::move(uri));
 	task->set_keep_alive(KAFKA_KEEPALIVE_DEFAULT);
 	return task;

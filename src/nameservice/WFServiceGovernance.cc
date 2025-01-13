@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <vector>
 #include <chrono>
 #include "URIParser.h"
@@ -34,6 +35,24 @@
 
 #define DNS_CACHE_LEVEL_1		1
 #define DNS_CACHE_LEVEL_2		2
+
+#define MTTR_SECONDS_DEFAULT	30
+
+WFServiceGovernance::WFServiceGovernance() :
+		breaker_lock(PTHREAD_MUTEX_INITIALIZER),
+		rwlock(PTHREAD_RWLOCK_INITIALIZER)
+{
+	this->nalives = 0;
+	this->try_another = false;
+	this->mttr_seconds = MTTR_SECONDS_DEFAULT;
+	INIT_LIST_HEAD(&this->breaker_list);
+}
+
+WFServiceGovernance::~WFServiceGovernance()
+{
+	for (EndpointAddress *addr : this->servers)
+		delete addr;
+}
 
 PolicyAddrParams::PolicyAddrParams()
 {
@@ -116,6 +135,12 @@ void WFSGResolverTask::dispatch()
 	WFNSTracing *tracing = ns_params_.tracing;
 	EndpointAddress *addr;
 
+	if (!sg_)
+	{
+		this->WFResolverTask::dispatch();
+		return;
+	}
+
 	if (sg_->pre_select_)
 	{
 		WFConditional *cond = sg_->pre_select_(this);
@@ -145,6 +170,7 @@ void WFSGResolverTask::dispatch()
 		}
 
 		tracing_data->history.push_back(addr);
+		sg_ = NULL;
 
 		copy_host_port(ns_params_.uri, addr);
 		dns_ttl_default_ = addr->params->dns_ttl_default;
@@ -219,7 +245,7 @@ void WFServiceGovernance::fuse_server_to_breaker(EndpointAddress *addr)
 	pthread_mutex_lock(&this->breaker_lock);
 	if (!addr->entry.list.next)
 	{
-		addr->broken_timeout = GET_CURRENT_SECOND + this->mttr_second;
+		addr->broken_timeout = GET_CURRENT_SECOND + this->mttr_seconds;
 		list_add_tail(&addr->entry.list, &this->breaker_list);
 		this->fuse_one_server(addr);
 	}
@@ -347,7 +373,6 @@ bool WFServiceGovernance::select(const ParsedURI& uri, WFNSTracing *tracing,
 		return false;
 	}
 
-	// select_addr == NULL will only happened in consistent_hash
 	EndpointAddress *select_addr = this->first_strategy(uri, tracing);
 
 	if (!select_addr ||
