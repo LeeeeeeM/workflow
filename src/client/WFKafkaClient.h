@@ -19,14 +19,13 @@
 #ifndef _WFKAFKACLIENT_H_
 #define _WFKAFKACLIENT_H_
 
-
 #include <string>
 #include <vector>
 #include <functional>
+#include <openssl/ssl.h>
+#include "WFTask.h"
 #include "KafkaMessage.h"
 #include "KafkaResult.h"
-#include "KafkaTaskImpl.inl"
-
 
 class WFKafkaTask;
 class WFKafkaClient;
@@ -120,7 +119,7 @@ protected:
 		this->finish = false;
 	}
 
-	virtual ~WFKafkaTask() {}
+	virtual ~WFKafkaTask() { }
 
 	virtual SubTask *done();
 
@@ -147,9 +146,22 @@ public:
 	// example: kafka://kafka.sogou
 	// example: kafka.sogou:9090
 	// example: kafka://10.160.23.23:9000,10.123.23.23,kafka://kafka.sogou
-	int init(const std::string& broker_url);
+	// example: kafkas://kafka.sogou  ->  kafka over TLS
+	int init(const std::string& broker_url)
+	{
+		return this->init(broker_url, NULL);
+	}
 
-	int init(const std::string& broker_url, const std::string& group);
+	int init(const std::string& broker_url, const std::string& group)
+	{
+		return this->init(broker_url, group, NULL);
+	}
+
+	// With a specific SSL_CTX. Effective only on brokers over TLS.
+	int init(const std::string& broker_url, SSL_CTX *ssl_ctx);
+
+	int init(const std::string& broker_url, const std::string& group,
+			 SSL_CTX *ssl_ctx);
 
 	int deinit();
 

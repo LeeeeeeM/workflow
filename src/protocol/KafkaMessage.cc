@@ -852,7 +852,7 @@ static int append_message_set(KafkaBlock *block,
 	char *crc_buf = (char *)block->get_block() + 8 + 4;
 
 	crc_32 = crc32(crc_32, (Bytef *)(crc_buf + 4), message_size - 4);
-	*(int *)crc_buf = htonl(crc_32);
+	*(uint32_t *)crc_buf = htonl(crc_32);
 
 	if (compress_buf(block, config.get_compress_type(), env) < 0)
 		return -1;
@@ -1450,10 +1450,11 @@ int KafkaMessage::parse_record_batch(void **buf, size_t *size,
 		return 1;
 
 	KafkaBlock block;
+	int compress_type = hdr.attributes & 7;
 
-	if (hdr.attributes & 7)
+	if (compress_type != 0)
 	{
-		if (uncompress_buf(*buf, hdr.length - 61 + 12, &block, hdr.attributes & 7) < 0)
+		if (uncompress_buf(*buf, hdr.length - 61 + 12, &block, compress_type) < 0)
 			return -1;
 
 		*buf = (char *)*buf + hdr.length - 61 + 12;
@@ -1492,7 +1493,7 @@ int KafkaMessage::parse_record_batch(void **buf, size_t *size,
 		}
 	}
 
-	if (hdr.attributes == 0)
+	if (compress_type == 0)
 	{
 		*buf = p;
 		*size = n;
@@ -1560,44 +1561,6 @@ int KafkaMessage::parse_records(void **buf, size_t *size, bool check_crcs,
 	*size -= msg_set_size;
 	*buf = (char *)*buf + msg_size;
 	return 0;
-}
-
-static bool __to_addr(const char *host, int port, struct sockaddr *sockaddr,
-					  socklen_t *addrlen)
-{
-	size_t len = strlen(host);
-	struct sockaddr_in *addr;
-	struct sockaddr_in6 *addr6;
-	bool ret = true;
-
-	if (!host)
-		ret = false;
-	else if (isdigit(host[0]) && isdigit(host[len - 1]))
-	{
-		addr = (struct sockaddr_in *)sockaddr;
-		if (inet_pton(AF_INET, host, &addr->sin_addr) == 1)
-		{
-			addr->sin_family = AF_INET;
-			*addrlen = sizeof(struct sockaddr_in);
-			addr->sin_port = htons(port);
-		}
-		else
-			ret = false;
-	}
-	else
-	{
-		addr6 = (struct sockaddr_in6 *)sockaddr;
-		if (inet_pton(AF_INET6, host, &addr6->sin6_addr) == 1)
-		{
-			addr6->sin6_family = AF_INET6;
-			*addrlen = sizeof(struct sockaddr_in6);
-			addr6->sin6_port = htons(port);
-		}
-		else
-			ret = false;
-	}
-
-	return ret;
 }
 
 KafkaMessage::KafkaMessage()
@@ -1701,23 +1664,62 @@ int KafkaMessage::encode_message(int api_type, struct iovec vectors[], int max)
 	return it->second(vectors, max);
 }
 
-static int kafka_get_api_version(const kafka_api_t *api, const KafkaConfig& conf,
-								 int api_type, int mvers, int message_version)
+static int kafka_api_get_max_ver(int api_type)
 {
-	int min_vers = 0;
+	switch (api_type)
+	{
+	case Kafka_Metadata:
+		return 4;
+	case Kafka_Produce:
+		return 7;
+	case Kafka_Fetch:
+		return 11;
+	case Kafka_FindCoordinator:
+		return 2;
+	case Kafka_JoinGroup:
+		return 5;
+	case Kafka_SyncGroup:
+		return 3;
+	case Kafka_Heartbeat:
+		return 3;
+	case Kafka_OffsetFetch:
+		return 1;
+	case Kafka_OffsetCommit:
+		return 7;
+	case Kafka_ListOffsets:
+		return 1;
+	case Kafka_LeaveGroup:
+		return 1;
+	case Kafka_ApiVersions:
+		return 0;
+	case Kafka_SaslHandshake:
+		return 1;
+	case Kafka_SaslAuthenticate:
+		return 0;
+	case Kafka_DescribeGroups:
+		return 0;
+	default:
+		return 0;
+	}
+}
+
+static int kafka_get_api_version(const kafka_api_t *api, const KafkaConfig& conf,
+								 int api_type, int max_ver, int message_version)
+{
+	int min_ver = 0;
 
 	if (api_type == Kafka_Produce)
 	{
 		if (message_version == 2)
-			min_vers = 3;
+			min_ver = 3;
 		else if (message_version == 1)
-			min_vers = 1;
+			min_ver = 1;
 
 		if (conf.get_compress_type() == Kafka_Zstd)
-			min_vers = 7;
+			min_ver = 7;
 	}
 
-	return kafka_broker_get_api_version(api, api_type, min_vers, mvers);
+	return kafka_broker_get_api_version(api, api_type, min_ver, max_ver);
 }
 
 int KafkaMessage::encode_head()
@@ -1726,6 +1728,8 @@ int KafkaMessage::encode_head()
 		this->api_version = 0;
 	else
 	{
+		int max_ver = kafka_api_get_max_ver(this->api_type);
+
 		if (this->api->features & KAFKA_FEATURE_MSGVER2)
 			this->message_version = 2;
 		else if (this->api->features & KAFKA_FEATURE_MSGVER1)
@@ -1745,10 +1749,8 @@ int KafkaMessage::encode_head()
 			this->config.set_compress_type(Kafka_NoCompress);
 		}
 
-		int mver = this->api_mver_map[this->api_type];
-
 		this->api_version = kafka_get_api_version(this->api, this->config,
-												  this->api_type, mver,
+												  this->api_type, max_ver,
 												  this->message_version);
 	}
 
@@ -2065,22 +2067,6 @@ KafkaRequest::KafkaRequest()
 	this->encode_func_map[Kafka_ApiVersions] = std::bind(&KafkaRequest::encode_apiversions, this, _1, _2);
 	this->encode_func_map[Kafka_SaslHandshake] = std::bind(&KafkaRequest::encode_saslhandshake, this, _1, _2);
 	this->encode_func_map[Kafka_SaslAuthenticate] = std::bind(&KafkaRequest::encode_saslauthenticate, this, _1, _2);
-
-	this->api_mver_map[Kafka_Metadata] = 4;
-	this->api_mver_map[Kafka_Produce] = 7;
-	this->api_mver_map[Kafka_Fetch] = 11;
-	this->api_mver_map[Kafka_FindCoordinator] = 2;
-	this->api_mver_map[Kafka_JoinGroup] = 5;
-	this->api_mver_map[Kafka_SyncGroup] = 3;
-	this->api_mver_map[Kafka_Heartbeat] = 3;
-	this->api_mver_map[Kafka_OffsetFetch] = 1;
-	this->api_mver_map[Kafka_OffsetCommit] = 7;
-	this->api_mver_map[Kafka_ListOffsets] = 1;
-	this->api_mver_map[Kafka_LeaveGroup] = 1;
-	this->api_mver_map[Kafka_ApiVersions] = 0;
-	this->api_mver_map[Kafka_SaslHandshake] = 1;
-	this->api_mver_map[Kafka_SaslAuthenticate] = 0;
-	this->api_mver_map[Kafka_DescribeGroups] = 0;
 }
 
 int KafkaRequest::encode_produce(struct iovec vectors[], int max)
@@ -2261,8 +2247,8 @@ int KafkaRequest::encode_produce(struct iovec vectors[], int max)
 			while ((block = this->serialized.get_block_insert_next()) != NULL)
 				crc_32 = crc32c(crc_32, block->get_block(), block->get_len());
 
-			*(int *)crc_ptr = htonl(crc_32);
-			*(int *)recordset_size_ptr = htonl(batch_length + 4 + 8);
+			*(uint32_t *)crc_ptr = htonl(crc_32);
+			*(uint32_t *)recordset_size_ptr = htonl(batch_length + 4 + 8);
 		}
 		else
 		{
@@ -2311,7 +2297,7 @@ int KafkaRequest::encode_produce(struct iovec vectors[], int max)
 				while ((block = this->serialized.get_block_insert_next()) != NULL)
 					crc_32 = crc32(crc_32, (Bytef *)block->get_block(), block->get_len());
 
-				*(int *)crc_ptr = htonl(crc_32);
+				*(uint32_t *)crc_ptr = htonl(crc_32);
 
 				KafkaBlock *wrap_block =  new KafkaBlock;
 
@@ -2323,10 +2309,10 @@ int KafkaRequest::encode_produce(struct iovec vectors[], int max)
 				}
 
 				this->serialized.insert_list(wrap_block);
-				*(int *)recordset_size_ptr = htonl(message_size + 8 + 4);
+				*(uint32_t *)recordset_size_ptr = htonl(message_size + 8 + 4);
 			}
 			else
-				*(int *)recordset_size_ptr = htonl(batch_length);
+				*(uint32_t *)recordset_size_ptr = htonl(batch_length);
 		}
 
 		++topic_cnt;
@@ -2401,7 +2387,7 @@ int KafkaRequest::encode_fetch(struct iovec vectors[], int max)
 		++topic_cnt;
 	}
 
-	*(int *)(this->msgbuf.c_str() + topic_cnt_pos) = htonl(topic_cnt);
+	*(uint32_t *)(this->msgbuf.c_str() + topic_cnt_pos) = htonl(topic_cnt);
 
 	//Length of the ForgottenTopics list
 	if (this->api_version >= 7)
@@ -2448,7 +2434,7 @@ int KafkaRequest::encode_metadata(struct iovec vectors[], int max)
 					this->config.get_allow_auto_topic_creation());
 	}
 
-	*(int *)(this->msgbuf.c_str() + topic_cnt_pos) = htonl(topic_cnt);
+	*(uint32_t *)(this->msgbuf.c_str() + topic_cnt_pos) = htonl(topic_cnt);
 	this->cur_size = this->msgbuf.size();
 
 	vectors[0].iov_base = (void *)this->msgbuf.c_str();
@@ -2489,7 +2475,7 @@ static std::string kafka_cgroup_gen_metadata(KafkaMetaList& meta_list)
 		meta_cnt++;
 	}
 
-	*(int *)(metadata.c_str() + meta_pos) = htonl(meta_cnt);
+	*(uint32_t *)(metadata.c_str() + meta_pos) = htonl(meta_cnt);
 
 	//UserData empty
 	append_bytes(metadata, "");
@@ -2528,7 +2514,7 @@ int KafkaRequest::encode_joingroup(struct iovec vectors[], int max)
 					 kafka_cgroup_gen_metadata(this->meta_list));
 	}
 
-	*(int *)(this->msgbuf.c_str() + protocol_pos) = htonl(protocol_cnt);
+	*(uint32_t *)(this->msgbuf.c_str() + protocol_pos) = htonl(protocol_cnt);
 
 	this->cur_size = this->msgbuf.size();
 
@@ -2562,7 +2548,7 @@ std::string KafkaMessage::get_member_assignment(kafka_member_t *member)
 	//userdata
 	append_bytes(assignment, "");
 
-	*(int *)(assignment.c_str() + topic_cnt_pos) = htonl(topic_cnt);
+	*(uint32_t *)(assignment.c_str() + topic_cnt_pos) = htonl(topic_cnt);
 
 	return assignment;
 }
@@ -2588,10 +2574,7 @@ int KafkaRequest::encode_syncgroup(struct iovec vectors[], int max)
 		}
 	}
 	else
-	{
 		append_i32(this->msgbuf, 0);
-		append_bytes(this->msgbuf, "");
-	}
 
 	this->cur_size = this->msgbuf.size();
 
@@ -2638,7 +2621,7 @@ int KafkaRequest::encode_listoffset(struct iovec vectors[], int max)
 		++topic_cnt;
 	}
 
-	*(int *)(this->msgbuf.c_str() + topic_cnt_pos) = htonl(topic_cnt);
+	*(uint32_t *)(this->msgbuf.c_str() + topic_cnt_pos) = htonl(topic_cnt);
 	this->cur_size = this->msgbuf.size();
 
 	vectors[0].iov_base = (void *)this->msgbuf.c_str();
@@ -2665,7 +2648,7 @@ int KafkaRequest::encode_offsetfetch(struct iovec vectors[], int max)
 		++topic_cnt;
 	}
 
-	*(int *)(this->msgbuf.c_str() + topic_cnt_pos) = htonl(topic_cnt);
+	*(uint32_t *)(this->msgbuf.c_str() + topic_cnt_pos) = htonl(topic_cnt);
 
 	this->cur_size = this->msgbuf.size();
 
@@ -2716,7 +2699,7 @@ int KafkaRequest::encode_offsetcommit(struct iovec vectors[], int max)
 		++toppar_cnt;
 	}
 
-	*(int *)(this->msgbuf.c_str() + toppar_cnt_pos) = htonl(toppar_cnt);
+	*(uint32_t *)(this->msgbuf.c_str() + toppar_cnt_pos) = htonl(toppar_cnt);
 
 	this->cur_size = this->msgbuf.size();
 
@@ -2847,11 +2830,6 @@ static int kafka_meta_parse_broker(void **buf, size_t *size,
 		if (api_version >= 1)
 			CHECK_RET(parse_string(buf, size, &ptr->rack));
 
-		if (__to_addr(ptr->host, ptr->port, (struct sockaddr *)&ptr->addr, &ptr->addrlen))
-		{
-			ptr->to_addr = 1;
-		}
-
 		broker_list->rewind();
 		KafkaBroker *last;
 
@@ -2874,37 +2852,29 @@ static int kafka_meta_parse_broker(void **buf, size_t *size,
 static bool kafka_broker_get_leader(int leader_id, KafkaBrokerList *broker_list,
 									kafka_broker_t *leader)
 {
-	broker_list->rewind();
 	KafkaBroker *bbroker;
 
+	broker_list->rewind();
 	while ((bbroker = broker_list->get_next()) != NULL)
 	{
 		if (bbroker->get_node_id() == leader_id)
 		{
 			kafka_broker_t *broker = bbroker->get_raw_ptr();
 
-			kafka_broker_deinit(leader);
-			kafka_broker_init(leader);
-			leader->node_id = broker->node_id;
-			leader->port = broker->port;
-
 			char *host = strdup(broker->host);
 			if (host)
 			{
-				char *rack;
+				char *rack = NULL;
 
 				if (broker->rack)
 					rack = strdup(broker->rack);
 
 				if (!broker->rack || rack)
 				{
-					if (broker->rack)
-						leader->rack = rack;
-
-					leader->to_addr = broker->to_addr;
-					memcpy(&leader->addr, &broker->addr, sizeof(struct sockaddr_storage));
-					leader->addrlen = broker->addrlen;
+					kafka_broker_deinit(leader);
+					*leader = *broker;
 					leader->host = host;
+					leader->rack = rack;
 					return true;
 				}
 
@@ -3027,15 +2997,10 @@ static int kafka_meta_parse_topic(void **buf, size_t *size,
 								  KafkaMetaList *meta_list,
 								  KafkaBrokerList *broker_list)
 {
+	KafkaMetaList lst;
 	int32_t topic_cnt;
+
 	CHECK_RET(parse_i32(buf, size, &topic_cnt));
-
-	if (topic_cnt < 0)
-	{
-		errno = EBADMSG;
-		return -1;
-	}
-
 	for (int32_t topic_idx = 0; topic_idx < topic_cnt; ++topic_idx)
 	{
 		int16_t error;
@@ -3047,15 +3012,21 @@ static int kafka_meta_parse_topic(void **buf, size_t *size,
 		if (!meta)
 			return -1;
 
-		kafka_meta_t *ptr = meta->get_raw_ptr();
+		KafkaMeta new_mta;
+		new_mta.set_topic(topic_name);
+
+		kafka_meta_t *ptr = new_mta.get_raw_ptr();
 		ptr->error = error;
 
 		if (api_version >= 1)
 			CHECK_RET(parse_i8(buf, size, &ptr->is_internal));
 
-		CHECK_RET(kafka_meta_parse_partition(buf, size, meta, broker_list));
+		CHECK_RET(kafka_meta_parse_partition(buf, size, &new_mta, broker_list));
+
+		lst.add_item(std::move(new_mta));
 	}
 
+	*meta_list = std::move(lst);
 	return 0;
 }
 
@@ -3124,17 +3095,9 @@ int KafkaResponse::parse_produce(void **buf, size_t *size)
 	int32_t partition;
 	int64_t base_offset, log_append_time, log_start_offset;
 	int32_t throttle_time;
-
-	CHECK_RET(parse_i32(buf, size, &topic_cnt));
-
-	if (topic_cnt < 0)
-	{
-		errno = EBADMSG;
-		return -1;
-	}
-
 	int produce_timeout = this->config.get_produce_timeout() * 2;
 
+	CHECK_RET(parse_i32(buf, size, &topic_cnt));
 	for (int32_t topic_idx = 0; topic_idx < topic_cnt; ++topic_idx)
 	{
 		CHECK_RET(parse_string(buf, size, topic_name));
@@ -3198,11 +3161,12 @@ int KafkaResponse::parse_produce(void **buf, size_t *size)
 
 int KafkaResponse::parse_fetch(void **buf, size_t *size)
 {
+	int32_t throttle_time;
+
 	this->toppar_list.rewind();
 	KafkaToppar *toppar;
 	while ((toppar = this->toppar_list.get_next()) != NULL)
 		toppar->clear_records();
-	int32_t throttle_time;
 
 	if (this->api_version >= 1)
 		CHECK_RET(parse_i32(buf, size, &throttle_time));
@@ -3216,14 +3180,6 @@ int KafkaResponse::parse_fetch(void **buf, size_t *size)
 	}
 
 	int32_t topic_cnt;
-	CHECK_RET(parse_i32(buf, size, &topic_cnt));
-
-	if (topic_cnt < 0)
-	{
-		errno = EBADMSG;
-		return -1;
-	}
-
 	std::string topic_name;
 	int32_t partition_cnt;
 	int32_t partition;
@@ -3232,6 +3188,7 @@ int KafkaResponse::parse_fetch(void **buf, size_t *size)
 	int64_t producer_id, first_offset;
 	int64_t high_watermark;
 
+	CHECK_RET(parse_i32(buf, size, &topic_cnt));
 	for (int32_t topic_idx = 0; topic_idx < topic_cnt; ++topic_idx)
 	{
 		CHECK_RET(parse_string(buf, size, topic_name));
@@ -3290,25 +3247,18 @@ int KafkaResponse::parse_fetch(void **buf, size_t *size)
 
 int KafkaResponse::parse_listoffset(void **buf, size_t *size)
 {
-	int32_t throttle_time, topic_cnt;
-
-	if (this->api_version >= 2)
-		CHECK_RET(parse_i32(buf, size, &throttle_time));
-
-	CHECK_RET(parse_i32(buf, size, &topic_cnt));
-
-	if (topic_cnt < 0)
-	{
-		errno = EBADMSG;
-		return -1;
-	}
-
+	int32_t throttle_time;
+	int32_t topic_cnt;
 	std::string topic_name;
 	int32_t partition_cnt;
 	int32_t partition;
 	int64_t offset_timestamp, offset;
 	int32_t offset_cnt;
 
+	if (this->api_version >= 2)
+		CHECK_RET(parse_i32(buf, size, &throttle_time));
+
+	CHECK_RET(parse_i32(buf, size, &topic_cnt));
 	for (int32_t topic_idx = 0; topic_idx < topic_cnt; ++topic_idx)
 	{
 		CHECK_RET(parse_string(buf, size, topic_name));
@@ -3371,12 +3321,6 @@ int KafkaResponse::parse_findcoordinator(void **buf, size_t *size)
 	CHECK_RET(parse_i32(buf, size, &cgroup->coordinator.node_id));
 	CHECK_RET(parse_string(buf, size, &cgroup->coordinator.host));
 	CHECK_RET(parse_i32(buf, size, &cgroup->coordinator.port));
-
-	if (__to_addr(cgroup->coordinator.host, cgroup->coordinator.port,
-				   (struct sockaddr *)&cgroup->coordinator.addr, &cgroup->coordinator.addrlen))
-	{
-		cgroup->coordinator.to_addr = 1;
-	}
 
 	return 0;
 }
@@ -3511,20 +3455,12 @@ int KafkaMessage::kafka_parse_member_assignment(const char *bbuf, size_t n,
 {
 	void **buf = (void **)&bbuf;
 	size_t *size = &n;
-	int32_t topic_cnt, partition_cnt;
+	int32_t topic_cnt;
+	int32_t partition_cnt;
 	int16_t version;
 	struct list_head *pos, *tmp;
 	std::string topic_name;
 	int32_t partition;
-
-	CHECK_RET(parse_i16(buf, size, &version));
-	CHECK_RET(parse_i32(buf, size, &topic_cnt));
-
-	if (topic_cnt < 0)
-	{
-		errno = EBADMSG;
-		return -1;
-	}
 
 	list_for_each_safe(pos, tmp, cgroup->get_assigned_toppar_list())
 	{
@@ -3533,6 +3469,8 @@ int KafkaMessage::kafka_parse_member_assignment(const char *bbuf, size_t n,
 		delete toppar;
 	}
 
+	CHECK_RET(parse_i16(buf, size, &version));
+	CHECK_RET(parse_i32(buf, size, &topic_cnt));
 	for (int32_t i = 0; i < topic_cnt; ++i)
 	{
 		CHECK_RET(parse_string(buf, size, topic_name));
@@ -3600,13 +3538,6 @@ int KafkaResponse::parse_offsetfetch(void **buf, size_t *size)
 	int32_t partition;
 
 	CHECK_RET(parse_i32(buf, size, &topic_cnt));
-
-	if (topic_cnt < 0)
-	{
-		errno = EBADMSG;
-		return -1;
-	}
-
 	for (int32_t topic_idx = 0; topic_idx < topic_cnt; ++topic_idx)
 	{
 		CHECK_RET(parse_string(buf, size, topic_name));
@@ -3643,17 +3574,10 @@ int KafkaResponse::parse_offsetcommit(void **buf, size_t *size)
 	int32_t partition_cnt;
 	int32_t partition;
 
-	if (this->api_version >= 1)
+	if (this->api_version >= 3)
 		CHECK_RET(parse_i32(buf, size, &throttle_time));
 
 	CHECK_RET(parse_i32(buf, size, &topic_cnt));
-
-	if (topic_cnt < 0)
-	{
-		errno = EBADMSG;
-		return -1;
-	}
-
 	for (int32_t topic_idx = 0; topic_idx < topic_cnt; ++topic_idx)
 	{
 		CHECK_RET(parse_string(buf, size, topic_name));
@@ -3820,7 +3744,7 @@ int KafkaResponse::handle_sasl_continue()
 		if (ret != (int)iovecs[i].iov_len)
 		{
 			if (ret >= 0)
-				errno = EAGAIN;
+				errno = ENOBUFS;
 			return -1;
 		}
 	}

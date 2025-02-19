@@ -16,6 +16,7 @@
   Authors: Wang Zhenpeng (wangzhenpeng@sogou-inc.com)
 */
 
+#include <stdio.h>
 #include <string.h>
 #include <string>
 #include <vector>
@@ -492,8 +493,6 @@ static bool create_tagged_address(const ConsulAddress& consul_address,
 		return false;
 
 	json_object_t *obj = json_value_object(val);
-	if (!obj)
-		return false;
 
 	if (!json_object_append(obj, "Address", JSON_VALUE_STRING,
 							consul_address.first.c_str()))
@@ -519,8 +518,6 @@ static bool create_health_check(const ConsulConfig& config, json_object_t *obj)
 		return false;
 
 	obj = json_value_object(val);
-	if (!obj)
-		return false;
 
 	str = config.get_check_name();
 	if (!json_object_append(obj, "Name", JSON_VALUE_STRING, str.c_str()))
@@ -549,8 +546,6 @@ static bool create_health_check(const ConsulConfig& config, json_object_t *obj)
 			return false;
 
 		json_object_t *header_obj = json_value_object(val);
-		if (!header_obj)
-			return false;
 
 		for (const auto& header : *config.get_http_headers())
 		{
@@ -560,8 +555,6 @@ static bool create_health_check(const ConsulConfig& config, json_object_t *obj)
 				return false;
 
 			json_array_t *arr = json_value_array(val);
-			if (!arr)
-				return false;
 
 			for (const auto& value : header.second)
 			{
@@ -637,8 +630,6 @@ static bool create_register_request(const json_value_t *root,
 		return false;
 
 	json_array_t *arr = json_value_array(val);
-	if (!arr)
-		return false;
 
 	for (const auto& tag : service->tags)
 	{
@@ -659,8 +650,6 @@ static bool create_register_request(const json_value_t *root,
 		return false;
 
 	json_object_t *meta_obj = json_value_object(val);
-	if (!meta_obj)
-		return false;
 
 	for (const auto& meta_kv : service->meta)
 	{
@@ -819,11 +808,11 @@ static bool parse_discover_node(const json_object_t *obj,
 	}
 
 	val = json_object_find("CreateIndex", obj);
-	if (val)
+	if (val && json_value_type(val) == JSON_VALUE_NUMBER)
 		instance->create_index = json_value_number(val);
 
 	val = json_object_find("ModifyIndex", obj);
-	if (val)
+	if (val && json_value_type(val) == JSON_VALUE_NUMBER)
 		instance->modify_index = json_value_number(val);
 
 	return true;
@@ -859,7 +848,7 @@ static bool parse_tagged_address(const char *name,
 
 	tagged_address.first = str;
 	val = json_object_find("Port", obj);
-	if (!val)
+	if (!val || json_value_type(val) != JSON_VALUE_NUMBER)
 		return false;
 
 	tagged_address.second = json_value_number(val);
@@ -1116,6 +1105,60 @@ static bool parse_discover_result(const json_value_t *root,
 	return true;
 }
 
+static void print_json_string(const char *str, std::string& json_str)
+{
+	json_str += "\"";
+	while (*str)
+	{
+		switch (*str)
+		{
+		case '\r':
+			json_str += "\\r";
+			break;
+		case '\n':
+			json_str += "\\n";
+			break;
+		case '\f':
+			json_str += "\\f";
+			break;
+		case '\b':
+			json_str += "\\b";
+			break;
+		case '\"':
+			json_str += "\\\"";
+			break;
+		case '\t':
+			json_str += "\\t";
+			break;
+		case '\\':
+			json_str += "\\\\";
+			break;
+		default:
+			if ((unsigned char)*str < 0x20)
+			{
+				char buf[8];
+				sprintf(buf, "\\u00%02x", *str);
+				json_str += buf;
+			}
+			else
+				json_str += *str;
+			break;
+		}
+		str++;
+	}
+	json_str += "\"";
+}
+
+static void print_json_number(double number, std::string& json_str)
+{
+	long long integer = number;
+
+	if (integer == number)
+		json_str += std::to_string(integer);
+	else
+		json_str += std::to_string(number);
+}
+
 static void print_json_object(const json_object_t *obj, int depth,
 							  std::string& json_str)
 {
@@ -1134,9 +1177,8 @@ static void print_json_object(const json_object_t *obj, int depth,
 		for (i = 0; i < depth + 1; i++)
 			json_str += "    ";
 
-		json_str += "\"";
-		json_str += name;
-		json_str += "\": ";
+		print_json_string(name, json_str);
+		json_str += ": ";
 		print_json_value(val, depth + 1, json_str);
 	}
 
@@ -1172,53 +1214,6 @@ static void print_json_array(const json_array_t *arr, int depth,
 		json_str += "    ";
 
 	json_str += "]";
-}
-
-static void print_json_string(const char *str, std::string& json_str)
-{
-	json_str += "\"";
-	while (*str)
-	{
-		switch (*str)
-		{
-		case '\r':
-			json_str += "\\r";
-			break;
-		case '\n':
-			json_str += "\\n";
-			break;
-		case '\f':
-			json_str += "\\f";
-			break;
-		case '\b':
-			json_str += "\\b";
-			break;
-		case '\"':
-			json_str += "\\\"";
-			break;
-		case '\t':
-			json_str += "\\t";
-			break;
-		case '\\':
-			json_str += "\\\\";
-			break;
-		default:
-			json_str += *str;
-			break;
-		}
-		str++;
-	}
-	json_str += "\"";
-}
-
-static void print_json_number(double number, std::string& json_str)
-{
-	long long integer = number;
-
-	if (integer == number)
-		json_str += std::to_string(integer);
-	else
-		json_str += std::to_string(number);
 }
 
 static void print_json_value(const json_value_t *val, int depth,

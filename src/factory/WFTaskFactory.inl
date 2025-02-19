@@ -24,11 +24,11 @@
 #include <time.h>
 #include <netdb.h>
 #include <stdio.h>
-#include <new>
 #include <string>
 #include <functional>
 #include <utility>
 #include <atomic>
+#include <openssl/ssl.h>
 #include "WFGlobal.h"
 #include "Workflow.h"
 #include "WFTask.h"
@@ -63,6 +63,26 @@ WFTaskFactory::create_dynamic_task(dynamic_create_t create)
 	return new __WFDynamicTask(std::move(create));
 }
 
+template<>
+int WFTaskFactory::send_by_name(const std::string&, void *const *, size_t);
+
+template<typename T>
+int WFTaskFactory::send_by_name(const std::string& mailbox_name, T *const msg[],
+								size_t max)
+{
+	return WFTaskFactory::send_by_name(mailbox_name, (void *const *)msg, max);
+}
+
+template<>
+int WFTaskFactory::signal_by_name(const std::string&, void *const *, size_t);
+
+template<typename T>
+int WFTaskFactory::signal_by_name(const std::string& cond_name, T *const msg[],
+								  size_t max)
+{
+	return WFTaskFactory::signal_by_name(cond_name, (void *const *)msg, max);
+}
+
 template<class REQ, class RESP, typename CTX = bool>
 class WFComplexClientTask : public WFClientTask<REQ, RESP>
 {
@@ -74,7 +94,9 @@ public:
 		WFClientTask<REQ, RESP>(NULL, WFGlobal::get_scheduler(), std::move(cb))
 	{
 		type_ = TT_TCP;
+		ssl_ctx_ = NULL;
 		fixed_addr_ = false;
+		fixed_conn_ = false;
 		retry_max_ = retry_max;
 		retry_times_ = 0;
 		redirect_ = false;
@@ -103,17 +125,19 @@ public:
 		init_with_uri();
 	}
 
-	void init(TransportType type,
+	void init(enum TransportType type,
 			  const struct sockaddr *addr,
 			  socklen_t addrlen,
 			  const std::string& info);
 
-	void set_transport_type(TransportType type)
+	void set_transport_type(enum TransportType type)
 	{
 		type_ = type;
 	}
 
-	TransportType get_transport_type() const { return type_; }
+	enum TransportType get_transport_type() const { return type_; }
+
+	void set_ssl_ctx(SSL_CTX *ssl_ctx) { ssl_ctx_ = ssl_ctx; }
 
 	virtual const ParsedURI *get_current_uri() const { return &uri_; }
 
@@ -123,7 +147,7 @@ public:
 		init(uri);
 	}
 
-	void set_redirect(TransportType type, const struct sockaddr *addr,
+	void set_redirect(enum TransportType type, const struct sockaddr *addr,
 					  socklen_t addrlen, const std::string& info)
 	{
 		redirect_ = true;
@@ -132,8 +156,12 @@ public:
 
 	bool is_fixed_addr() const { return this->fixed_addr_; }
 
+	bool is_fixed_conn() const { return this->fixed_conn_; }
+
 protected:
 	void set_fixed_addr(int fixed) { this->fixed_addr_ = fixed; }
+
+	void set_fixed_conn(int fixed) { this->fixed_conn_ = fixed; }
 
 	void set_info(const std::string& info)
 	{
@@ -151,11 +179,10 @@ protected:
 
 	void clear_resp()
 	{
-		size_t size = this->resp.get_size_limit();
-
+		protocol::ProtocolMessage head(std::move(this->resp));
 		this->resp.~RESP();
-		new(&this->resp) RESP();
-		this->resp.set_size_limit(size);
+		new(&this->resp) RESP;
+		*(protocol::ProtocolMessage *)&this->resp = std::move(head);
 	}
 
 	void disable_retry()
@@ -164,10 +191,12 @@ protected:
 	}
 
 protected:
-	TransportType type_;
+	enum TransportType type_;
 	ParsedURI uri_;
 	std::string info_;
+	SSL_CTX *ssl_ctx_;
 	bool fixed_addr_;
+	bool fixed_conn_;
 	bool redirect_;
 	CTX ctx_;
 	int retry_max_;
@@ -206,7 +235,7 @@ void WFComplexClientTask<REQ, RESP, CTX>::clear_prev_state()
 }
 
 template<class REQ, class RESP, typename CTX>
-void WFComplexClientTask<REQ, RESP, CTX>::init(TransportType type,
+void WFComplexClientTask<REQ, RESP, CTX>::init(enum TransportType type,
 											   const struct sockaddr *addr,
 											   socklen_t addrlen,
 											   const std::string& info)
@@ -224,7 +253,7 @@ void WFComplexClientTask<REQ, RESP, CTX>::init(TransportType type,
 	info_.assign(info);
 	params.use_tls_sni = false;
 	if (WFGlobal::get_route_manager()->get(type, &addrinfo, info_, &params,
-										   "", route_result_) < 0)
+										   "", ssl_ctx_, route_result_) < 0)
 	{
 		this->state = WFT_STATE_SYS_ERROR;
 		this->error = errno;
@@ -314,7 +343,9 @@ WFRouterTask *WFComplexClientTask<REQ, RESP, CTX>::route()
 		.type			=	type_,
 		.uri			=	uri_,
 		.info			=	info_.c_str(),
+		.ssl_ctx		=	ssl_ctx_,
 		.fixed_addr		=	fixed_addr_,
+		.fixed_conn		=	fixed_conn_,
 		.retry_times	=	retry_times_,
 		.tracing		=	&tracing_,
 	};
@@ -452,12 +483,10 @@ SubTask *WFComplexClientTask<REQ, RESP, CTX>::done()
 		}
 	}
 
-	/*
-	 * When target is NULL, it's very likely that we are in the caller's
-	 * thread or DNS thread (dns failed). Running a timer will switch callback
-	 * function to a handler thread, and this can prevent stack overflow.
-	 */
-	if (!this->target)
+	/* When the target or the connection is NULL, it's very likely that we are
+	 * in the caller's thread. Running a timer will switch callback function to
+	 * a handler thread, and this can prevent stack overflow. */
+	if (!this->target || !this->CommSession::get_connection())
 	{
 		auto&& cb = std::bind(&WFComplexClientTask::switch_callback,
 							  this,
@@ -477,22 +506,28 @@ SubTask *WFComplexClientTask<REQ, RESP, CTX>::done()
 
 template<class REQ, class RESP>
 WFNetworkTask<REQ, RESP> *
-WFNetworkTaskFactory<REQ, RESP>::create_client_task(TransportType type,
+WFNetworkTaskFactory<REQ, RESP>::create_client_task(enum TransportType type,
 													const std::string& host,
 													unsigned short port,
 													int retry_max,
 													std::function<void (WFNetworkTask<REQ, RESP> *)> callback)
 {
 	auto *task = new WFComplexClientTask<REQ, RESP>(retry_max, std::move(callback));
-	char buf[8];
-	std::string url = "scheme://";
 	ParsedURI uri;
+	char buf[32];
 
 	sprintf(buf, "%u", port);
-	url += host;
-	url += ":";
-	url += buf;
-	URIParser::parse(url, uri);
+	uri.scheme = strdup("scheme");
+	uri.host = strdup(host.c_str());
+	uri.port = strdup(buf);
+	if (!uri.scheme || !uri.host || !uri.port)
+	{
+		uri.state = URI_STATE_ERROR;
+		uri.error = errno;
+	}
+	else
+		uri.state = URI_STATE_SUCCESS;
+
 	task->init(std::move(uri));
 	task->set_transport_type(type);
 	return task;
@@ -500,7 +535,7 @@ WFNetworkTaskFactory<REQ, RESP>::create_client_task(TransportType type,
 
 template<class REQ, class RESP>
 WFNetworkTask<REQ, RESP> *
-WFNetworkTaskFactory<REQ, RESP>::create_client_task(TransportType type,
+WFNetworkTaskFactory<REQ, RESP>::create_client_task(enum TransportType type,
 													const std::string& url,
 													int retry_max,
 													std::function<void (WFNetworkTask<REQ, RESP> *)> callback)
@@ -516,7 +551,7 @@ WFNetworkTaskFactory<REQ, RESP>::create_client_task(TransportType type,
 
 template<class REQ, class RESP>
 WFNetworkTask<REQ, RESP> *
-WFNetworkTaskFactory<REQ, RESP>::create_client_task(TransportType type,
+WFNetworkTaskFactory<REQ, RESP>::create_client_task(enum TransportType type,
 													const ParsedURI& uri,
 													int retry_max,
 													std::function<void (WFNetworkTask<REQ, RESP> *)> callback)
@@ -530,7 +565,7 @@ WFNetworkTaskFactory<REQ, RESP>::create_client_task(TransportType type,
 
 template<class REQ, class RESP>
 WFNetworkTask<REQ, RESP> *
-WFNetworkTaskFactory<REQ, RESP>::create_client_task(TransportType type,
+WFNetworkTaskFactory<REQ, RESP>::create_client_task(enum TransportType type,
 													const struct sockaddr *addr,
 													socklen_t addrlen,
 													int retry_max,
@@ -544,11 +579,26 @@ WFNetworkTaskFactory<REQ, RESP>::create_client_task(TransportType type,
 
 template<class REQ, class RESP>
 WFNetworkTask<REQ, RESP> *
+WFNetworkTaskFactory<REQ, RESP>::create_client_task(enum TransportType type,
+													const struct sockaddr *addr,
+													socklen_t addrlen,
+													SSL_CTX *ssl_ctx,
+													int retry_max,
+													std::function<void (WFNetworkTask<REQ, RESP> *)> callback)
+{
+	auto *task = new WFComplexClientTask<REQ, RESP>(retry_max, std::move(callback));
+
+	task->set_ssl_ctx(ssl_ctx);
+	task->init(type, addr, addrlen, "");
+	return task;
+}
+
+template<class REQ, class RESP>
+WFNetworkTask<REQ, RESP> *
 WFNetworkTaskFactory<REQ, RESP>::create_server_task(CommService *service,
 				std::function<void (WFNetworkTask<REQ, RESP> *)>& process)
 {
-	return new WFServerTask<REQ, RESP>(service, WFGlobal::get_scheduler(),
-									   process);
+	return new WFServerTask<REQ, RESP>(service, WFGlobal::get_scheduler(), process);
 }
 
 /**********Server Factory**********/
@@ -556,8 +606,12 @@ WFNetworkTaskFactory<REQ, RESP>::create_server_task(CommService *service,
 class WFServerTaskFactory
 {
 public:
+	static WFDnsTask *create_dns_task(CommService *service,
+					std::function<void (WFDnsTask *)>& process);
+
 	static WFHttpTask *create_http_task(CommService *service,
 					std::function<void (WFHttpTask *)>& process);
+
 	static WFMySQLTask *create_mysql_task(CommService *service,
 					std::function<void (WFMySQLTask *)>& process);
 };
@@ -669,26 +723,24 @@ void WFTaskFactory::reset_go_task(WFGoTask *task, FUNC&& func, ARGS&&... args)
 {
 	auto&& tmp = std::bind(std::forward<FUNC>(func),
 						   std::forward<ARGS>(args)...);
-	static_cast<__WFGoTask *>(task)->set_go_func(std::move(tmp));
+	((__WFGoTask *)task)->set_go_func(std::move(tmp));
 }
 
 /**********Create go task with nullptr func**********/
 
-template<>
-inline WFGoTask *WFTaskFactory::create_go_task<std::nullptr_t>
-										(const std::string& queue_name,
-										 std::nullptr_t&& func)
+template<> inline
+WFGoTask *WFTaskFactory::create_go_task(const std::string& queue_name,
+										std::nullptr_t&&)
 {
 	return new __WFGoTask(WFGlobal::get_exec_queue(queue_name),
 						  WFGlobal::get_compute_executor(),
 						  nullptr);
 }
 
-template<>
-inline WFGoTask *WFTaskFactory::create_timedgo_task<std::nullptr_t>
-										(time_t seconds, long nanoseconds,
-										 const std::string& queue_name,
-										 std::nullptr_t&& func)
+template<> inline
+WFGoTask *WFTaskFactory::create_timedgo_task(time_t seconds, long nanoseconds,
+											 const std::string& queue_name,
+											 std::nullptr_t&&)
 {
 	return new __WFTimedGoTask(seconds, nanoseconds,
 							   WFGlobal::get_exec_queue(queue_name),
@@ -696,28 +748,25 @@ inline WFGoTask *WFTaskFactory::create_timedgo_task<std::nullptr_t>
 							   nullptr);
 }
 
-template<>
-inline WFGoTask *WFTaskFactory::create_go_task<std::nullptr_t>
-										(ExecQueue *queue, Executor *executor,
-										 std::nullptr_t&& func)
+template<> inline
+WFGoTask *WFTaskFactory::create_go_task(ExecQueue *queue, Executor *executor,
+										std::nullptr_t&&)
 {
 	return new __WFGoTask(queue, executor, nullptr);
 }
 
-template<>
-inline WFGoTask *WFTaskFactory::create_timedgo_task<std::nullptr_t>
-										(time_t seconds, long nanoseconds,
-										 ExecQueue *queue, Executor *executor,
-										 std::nullptr_t&& func)
+template<> inline
+WFGoTask *WFTaskFactory::create_timedgo_task(time_t seconds, long nanoseconds,
+											 ExecQueue *queue, Executor *executor,
+											 std::nullptr_t&&)
 {
 	return new __WFTimedGoTask(seconds, nanoseconds, queue, executor, nullptr);
 }
 
-template<>
-inline void WFTaskFactory::reset_go_task<std::nullptr_t>
-										(WFGoTask *task, std::nullptr_t&& func)
+template<> inline
+void WFTaskFactory::reset_go_task(WFGoTask *task, std::nullptr_t&&)
 {
-	static_cast<__WFGoTask *>(task)->set_go_func(nullptr);
+	((__WFGoTask *)task)->set_go_func(nullptr);
 }
 
 /**********Template Thread Task Factory**********/
@@ -818,8 +867,17 @@ void __WFTimedThreadTask<INPUT, OUTPUT>::timer_callback(WFTimerTask *timer)
 
 	if (--task->ref == 3)
 	{
-		task->state = WFT_STATE_ABORTED;
-		task->error = 0;
+		if (timer->get_state() == WFT_STATE_SUCCESS)
+		{
+			task->state = WFT_STATE_SYS_ERROR;
+			task->error = ETIMEDOUT;
+		}
+		else
+		{
+			task->state = timer->get_state();
+			task->error = timer->get_error();
+		}
+
 		task->subtask_done();
 	}
 
@@ -875,40 +933,5 @@ WFThreadTaskFactory<INPUT, OUTPUT>::create_thread_task(time_t seconds, long nano
 												  queue, executor,
 												  std::move(routine),
 												  std::move(callback));
-}
-
-template<class INPUT, class OUTPUT>
-class __WFThreadTask__ : public __WFThreadTask<INPUT, OUTPUT>
-{
-private:
-	virtual SubTask *done() { return NULL; }
-
-public:
-	using __WFThreadTask<INPUT, OUTPUT>::__WFThreadTask;
-};
-
-template<class INPUT, class OUTPUT>
-WFMultiThreadTask<INPUT, OUTPUT> *
-WFThreadTaskFactory<INPUT, OUTPUT>::create_multi_thread_task(const std::string& queue_name,
-						std::function<void (INPUT *, OUTPUT *)> routine, size_t nthreads,
-						std::function<void (WFMultiThreadTask<INPUT, OUTPUT> *)> callback)
-{
-	WFThreadTask<INPUT, OUTPUT> **tasks = new WFThreadTask<INPUT, OUTPUT> *[nthreads];
-	char buf[32];
-	size_t i;
-
-	for (i = 0; i < nthreads; i++)
-	{
-		sprintf(buf, "-%zu@MTT", i);
-		tasks[i] = new __WFThreadTask__<INPUT, OUTPUT>
-							(WFGlobal::get_exec_queue(queue_name + buf),
-							 WFGlobal::get_compute_executor(),
-							 std::function<void (INPUT *, OUTPUT *)>(routine),
-							 nullptr);
-	}
-
-	auto *mt = new WFMultiThreadTask<INPUT, OUTPUT>(tasks, nthreads, std::move(callback));
-	delete []tasks;
-	return mt;
 }
 
