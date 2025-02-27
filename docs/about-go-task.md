@@ -14,6 +14,9 @@ public:
                                     FUNC&& func, ARGS&&... args);
 };
 ~~~
+函数参数的queue_name为计算队列名，其作用在之前示例文档中有过介绍。  
+func可以是函数指针，函数对象，仿函数，lambda函数，类的成员函数等任意可调用对象。  
+args为func的参数列表。注意当func是一个类的非静态成员函数时，args的第一个成员必须是对象地址。
 
 # 示例
 我们想异步的运行一个加法函数：void add(int a, int b, int& res);  
@@ -62,7 +65,7 @@ int main(void)
 class WFTaskFactory
 {
     /* Create 'Go' task with running time limit in seconds plus nanoseconds.
-     * If time exceeded, state WFT_STATE_ABORTED will be got in callback. */
+     * If time exceeded, state WFT_STATE_SYS_ERROR and error ETIMEDOUT will be got in callback. */
     template<class FUNC, class... ARGS>
     static WFGoTask *create_timedgo_task(time_t seconds, long nanoseconds,
                                          const std::string& queue_name,
@@ -70,7 +73,7 @@ class WFTaskFactory
 };
 ~~~
 相比创建普通的go task，create_timedgo_task函数需要多传两个参数，seconds和nanoseconds。  
-如果func的运行时间到达seconds+nanosconds时限，task直接callback，且state为WFT_STATE_ABORTED。  
+如果func的运行时间到达seconds+nanosconds时限，task直接callback，且state为WFT_STATE_SYS_ERROR，error为ETIMEDOUT。  
 注意，框架无法中断用户执行中的任务。func依然会继续执行到结束，但不会再次callback。另外，nanoseconds取值区间在\[0,10亿）。  
 另外，当我们给go task加上了运行时间限制，callback的时机可能会先于func函数的结束，任务所在series可能也会先于func结束。  
 如果我们在func里访问series，可能就是一个错误了。例如：
@@ -99,7 +102,7 @@ int main()
         {
              ...
         }
-        else // state == WFT_STATE_ABORTED.         // 超过运行时间限制
+        else // state == WFT_STATE_SYS_ERROR && error == ETIMEDOUT  // 超过运行时间限制
         {
              ...
         }
@@ -120,7 +123,7 @@ int main()
         {
 		    int result = (int)task->user_data;
         }
-        else // state == WFT_STATE_ABORTED.         // 超过运行时间限制
+        else // state == WFT_STATE_SYS_ERROR && error == ETIMEDOUT    // 超过运行时间限制
         {
 		    ...
         }
@@ -140,7 +143,7 @@ WFGoTask *task = WFTaskFactory::create_timedgo_task(1, 0, "test", [task]() {
 ~~~
 这段代码并不能在lambda函数里得到task指针，因为捕获执行时，task还没有赋值。但我们可以通过以下的代码，实现这个需求：
 ~~~cpp
-WFGoTask *task = WFTaskFactory::create_timedgo_task(1, 0, "test", [](){});
+WFGoTask *task = WFTaskFactory::create_timedgo_task(1, 0, "test", nullptr);  // 执行函数可以初始化为nullptr
 WFTaskFactory::reset_go_task(task, [task]() {
         task->user_data = (void *)123;
     });

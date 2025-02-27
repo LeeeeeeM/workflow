@@ -3,10 +3,7 @@ set_default(false)
 
 add_deps("workflow")
 
-add_links("crypto")
-add_links("ssl")
-
-if not is_os("macosx") then
+if not is_plat("macosx") then
     add_ldflags("-lrt")
 end
 

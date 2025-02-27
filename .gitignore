@@ -13,6 +13,7 @@
 
 # Compiled Dynamic libraries
 *.so
+*.so.*
 *.dylib
 *.dll
 
@@ -41,3 +42,8 @@ bazel-*
 .idea
 cmake-build-debug/
 workflow-config.cmake
+
+# xmake configs
+.xmake
+build.xmake
+_include

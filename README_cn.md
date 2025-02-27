@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://github.com/sogou/workflow/blob/master/LICENSE)
 [![Language](https://img.shields.io/badge/language-c++-red.svg)](https://en.cppreference.com/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)](https://img.shields.io/badge/platform-linux%20%7C%20macos20%7C%20windows-lightgrey.svg)
-[![Build Status](https://img.shields.io/github/workflow/status/sogou/workflow/ci%20build)](https://github.com/sogou/workflow/actions?query=workflow%3A%22ci+build%22++)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/sogou/workflow/ci.yml?branch=master)](https://github.com/sogou/workflow/actions?query=workflow%3A%22ci+build%22++)
 
 搜狗公司C++服务器引擎，编程范式。支撑搜狗几乎所有后端C++在线服务，包括所有搜索服务，云输入法，在线广告等，每日处理数百亿请求。这是一个设计轻盈优雅的企业级程序引擎，可以满足大多数后端与嵌入式开发需求。  
 #### 你可以用来：
@@ -29,6 +29,7 @@ int main()
 ~~~
 * 作为万能异步客户端。目前支持``http``，``redis``，``mysql``和``kafka``协议。
   * 轻松构建效率极高的spider。
+  * ``mysql``协议同时也支持``MariaDB``和``TiDB``等数据库。
 * 实现自定义协议client/server，构建自己的RPC系统。
   * [srpc](https://github.com/sogou/srpc)就是以它为基础，作为独立项目开源。支持``srpc``，``brpc``，``trpc``和``thrift``等协议。
 * 构建异步任务流，支持常用的串并联，也支持更加复杂的DAG结构。
@@ -37,7 +38,6 @@ int main()
 * 实现任何计算与通讯关系非常复杂的高性能高并发的后端服务。
 * 构建微服务系统。
   * 项目内置服务治理与负载均衡等功能。
-  * 使用[workflow-k8s](https://github.com/sogou/workflow-k8s)插件，可将服务治理与kubernetes的自动部署融合。
 * Wiki链接 : [PaaS 架构图](https://github.com/sogou/workflow/wiki)
 
 #### 编译和运行环境
@@ -45,7 +45,7 @@ int main()
   *  ``Windows``版以[windows](https://github.com/sogou/workflow/tree/windows)分支发布，使用``iocp``实现异步网络。用户接口与``Linux``版一致。
 * 支持所有CPU平台，包括32或64位``x86``处理器，大端或小端``arm``处理器，国产``loongson``龙芯处理器实测支持。
 * 需要依赖于``OpenSSL``，推荐``OpenSSL 1.1``及以上版本。
-  * 不喜欢SSL的用户可以使用[nossl](https://github.com/sogou/workflow/tree/nossl)分支，代码更简洁。但仍需链接``crypto``。
+  * 不喜欢SSL的用户可以使用[nossl](https://github.com/sogou/workflow/tree/nossl)分支，代码更简洁。
 * 项目使用了``C++11``标准，需要用支持``C++11``的编译器编译。但不依赖``boost``或``asio``。
 * 项目无其它依赖。如需使用``kafka``协议，需自行安装``lz4``，``zstd``和``snappy``几个压缩库。
 
@@ -57,6 +57,12 @@ make
 cd tutorial
 make
 ~~~
+#### 使用SRPC工具（NEW!）
+SRPC工具可以生成完整的workflow工程，根据用户命令生成对应的server，client或proxy框架，以及CMake工程文件和JSON格式的配置文件。  
+并且，工具会下载最小的必要的依赖。例如在用户指定产生RPC项目时，自动下载并配置好protobuf等依赖。  
+SRPC工具的使用方法可以参考：https://github.com/sogou/srpc/blob/master/tools/README_cn.md
+
+#### Debian Linux或ubuntu上使用[apt-get](https://launchpad.net/ubuntu/+source/workflow)安装：
 作为是Debian Linux与Ubuntu Linux 22.04版自带软件，可以通过``apt-get``命令直接安装开发包：
 ~~~sh
 sudo apt-get install libworkflow-dev
@@ -65,8 +71,17 @@ sudo apt-get install libworkflow-dev
 ~~~sh
 sudo apt-get install workflow1
 ~~~
-注意Ubuntu Linux只有最新22.04版自带workflow。更推荐用git直接下载最新源代码编译。
-
+注意ubuntu只有最新22.04版或以上自带workflow。更推荐用git直接下载最新源代码编译。
+#### Fedora Linux上使用[dnf](https://packages.fedoraproject.org/pkgs/workflow)安装：
+Workflow也是Fedora Linux的自带软件，可以使用最新的rpm包管理工具``dnf``直接安装开发包：
+~~~~sh
+sudo dnf install workflow-devel
+~~~~
+或部署运行环境：
+~~~~sh
+sudo dnf install workflow
+~~~~
+#### 使用xmake
 如果你想用xmake去构建 workflow, 你可以看 [xmake build document](docs/xmake.md)
 
 # 示例教程
@@ -93,11 +108,13 @@ sudo apt-get install workflow1
     * [异步IO的http server：http_file_server](docs/tutorial-09-http_file_server.md)
   * 用户定义协议基础
     * [简单的用户自定义协议client/server](docs/tutorial-10-user_defined_protocol.md)
+    * [使用TLV格式消息](docs/about-tlv-message.md)
   * 其它一些重要任务与组件
     * [关于定时器](docs/about-timer.md)
     * [关于计数器](docs/about-counter.md)
-    * [模块任务](/docs/about-module.md)
-    * [DAG图任务](/docs/tutorial-11-graph_task.md)
+    * [模块任务](docs/about-module.md)
+    * [DAG图任务](docs/tutorial-11-graph_task.md)
+    * [Selector任务](docs/about-selector.md)
   * 任务间通信
     * [条件任务与观察者模式](docs/about-conditional.md)
     * [资源池与消息队列](docs/about-resource-pool.md)
@@ -111,6 +128,7 @@ sudo apt-get install workflow1
     * [异步MySQL客户端：mysql_cli](docs/tutorial-12-mysql_cli.md)
     * [异步kafka客户端：kafka_cli](docs/tutorial-13-kafka_cli.md)
     * [异步DNS客户端：dns_cli](docs/tutorial-17-dns_cli.md)
+    * [Redis订阅客户端：redis_subscriber](docs/tutorial-18-redis_subscriber.md)
 
 #### 编程范式
 
@@ -155,7 +173,9 @@ sudo apt-get install workflow1
 # 使用中有疑问？
 可以先查看[FAQ](https://github.com/sogou/workflow/issues/170)和[issues](https://github.com/sogou/workflow/issues)列表，看看是否能找到答案。  
 非常欢迎将您使用中遇到的问题发送到[issues](https://github.com/sogou/workflow/issues)，我们将第一时间进行解答。同时更多的issue对新用户也会带来帮助。  
-也可以通过QQ群：``618773193`` 联系我们。
+也可以通过QQ群：**618773193** 联系我们。
+
+<img src="https://user-images.githubusercontent.com/1880011/92300953-e9cc5400-ef91-11ea-82f5-4cf3174cd851.jpeg" align=center width = "200" alt="qq_qrcode" />
 
 #### Gitee仓库
 用户可以在访问GitHub遇到困难时，使用我们的Gitee官方仓库：https://gitee.com/sogou/workflow  
